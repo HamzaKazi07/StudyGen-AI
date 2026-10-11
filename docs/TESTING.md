@@ -8,7 +8,7 @@ The backend uses Python `unittest` and FastAPI `TestClient`. Run from `backend/`
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The current suite count is recorded below after verification. Tests use temporary SQLite and document directories; Gemini streaming is mocked, and no live provider key or request is needed.
+The complete backend suite currently runs 51 tests (one skipped because symlink creation is unavailable in the test environment). The focused document-storage suite runs 12 tests (the same symlink test is skipped). Tests use temporary SQLite and document directories; Gemini streaming is mocked, and no live provider key or request is needed.
 
 Coverage includes:
 
@@ -17,6 +17,7 @@ Coverage includes:
 - Auth registration, duplicate and invalid/malformed credentials, disallowed Origin, logout, HttpOnly cookie issuance, hashed session storage, and expired-session rejection.
 - Own-document upload/read, owner-scoped listing, foreign-user content/delete/tutor denial, and missing/unprocessed/unavailable/empty document cases.
 - General and document-aware tutor behavior, SSE start/chunk/done/error responses, mocked provider composition for facts/proposals/unverified implementation/contradictions/missing evidence/excerpt scope, context length boundary, and prompt-injection-like document text handling.
+- Isolated document-storage tests use temporary directories and SQLite to check UUID/filename validation, traversal and symlink rejection (where supported), no-overwrite atomic text installation, staging-file cleanup failure, upload transaction rollback/cleanup, source and processed-file deletion failures with tombstone retry, missing files/metadata, and protection of unrelated files.
 - Upload/auth storage failure handling and cleanup, transactional migration rollback, dry-run/explicit legacy import, and rejected mapping without partial inserts.
 
 One Starlette `TestClient` deprecation warning about the installed `httpx` integration is emitted by the existing environment. The tests do not use a live browser and do not prove provider-side cancellation.

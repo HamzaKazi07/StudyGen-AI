@@ -36,8 +36,9 @@ Implemented:
 - Backend accepts `.pdf`, `.docx`, and `.txt`; a supplied multipart content type must be from the allowed PDF/DOCX/TXT set.
 - The upload handler reads in 1 MiB chunks and enforces a 20 MiB application-level maximum.
 - Physical filenames are server-generated UUID names; the client filename is display metadata.
-- The backend extracts text to a separate local file. Metadata (including owner ID) is inserted transactionally only after extraction succeeds. On an upload failure, temporary files are cleaned up or the response explicitly says cleanup could not be confirmed.
-- Delete first hides the owner-scoped row with a tombstone, validates generated file references, removes the files, then deletes the row. Database/file operations are not one atomic transaction; failures return `503` and can be retried.
+- Storage paths validate the UUID and generated filename, reject path traversal and symbolic links, and resolve within the configured storage root. Original files are created exclusively; extracted text is written to a unique temporary file and atomically installed without overwriting an existing destination.
+- The backend extracts text to a separate local file. Metadata (including owner ID) is inserted transactionally only after extraction succeeds. Upload files and SQLite metadata are separate resources: upload failure triggers operation-scoped cleanup, but a process crash or cleanup failure can leave orphaned files. If the filesystem refuses removal of the unique staging file after installation, the installed document file is cleaned up, but a hidden `.tmp` staging artifact may remain for manual cleanup; the API reports that cleanup could not be confirmed.
+- Delete first hides the owner-scoped row with a tombstone, validates generated file references, attempts removal of both files, then deletes the row only when all file removals succeed. Missing files are handled idempotently. On a partial file-removal failure, the tombstoned row remains for retry; some files may already be gone while others remain. SQLite and filesystem operations cannot be committed atomically, so a crash after file removal but before row deletion can also leave tombstoned metadata without files.
 
 Remaining gaps:
 

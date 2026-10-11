@@ -11,6 +11,17 @@ from docx import Document
 
 from database import open_connection, transaction
 from services.auth import get_current_user, require_csrf
+from services.document_storage import (
+    InvalidDocumentPath,
+    ProcessedTextCleanupError,
+    create_upload_file,
+    delete_document_files as remove_document_files,
+    processed_filename,
+    remove_created_files,
+    safe_storage_path as resolve_storage_path,
+    source_filename,
+    write_processed_text,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -74,66 +85,30 @@ def document_response(row) -> dict:
 
 def safe_storage_path(
     directory: Path,
+    document_id: str,
     filename: str | None,
-    expected_filename: str | None = None,
+    expected_filename: str,
 ) -> Path:
-    if (
-        not filename
-        or Path(filename).name != filename
-        or (expected_filename is not None and filename != expected_filename)
-    ):
+    try:
+        return resolve_storage_path(
+            directory,
+            document_id,
+            filename,
+            expected_filename,
+        )
+    except InvalidDocumentPath as error:
         raise HTTPException(
             status_code=404,
             detail="Document file is unavailable.",
-        )
-    root = directory.resolve()
-    path = (root / filename).resolve()
-    if path.parent != root:
-        raise HTTPException(
-            status_code=404,
-            detail="Document file is unavailable.",
-        )
-    return path
+        ) from error
 
 
-def cleanup_document_files(document) -> bool:
-
-    document_id = document.get("id")
-    source_filename = document.get("filename")
-    source_extension = Path(source_filename).suffix.lower() if source_filename else ""
-    paths = (
-        (
-            UPLOAD_DIR,
-            source_filename,
-            f"{document_id}{source_extension}"
-            if source_extension in ALLOWED_EXTENSIONS
-            else None,
-        ),
-        (
-            PROCESSED_DIR,
-            document.get("processed_filename"),
-            f"{document_id}.txt",
-        ),
-    )
-    succeeded = True
-    for location, filename, expected_filename in paths:
-        if not filename:
-            continue
-
-        try:
-            file_path = safe_storage_path(
-                location,
-                filename,
-                expected_filename,
-            )
-            if file_path.exists():
-                file_path.unlink()
-        except HTTPException:
-            logger.error("Refusing to clean up an unsafe document path")
-            succeeded = False
-        except OSError:
-            logger.exception("Document file cleanup failed")
-            succeeded = False
+def cleanup_document_files(
+    created_files: list[tuple[Path, str, str, str]],
+) -> bool:
+    succeeded = remove_created_files(created_files)
+    if not succeeded:
+        logger.error("Document upload cleanup failed")
     return succeeded
 
 
@@ -245,18 +220,7 @@ def save_processed_text(
     document_id: str,
     text: str
 ) -> Path:
-
-    processed_file = (
-        PROCESSED_DIR /
-        f"{document_id}.txt"
-    )
-
-    processed_file.write_text(
-        text,
-        encoding="utf-8"
-    )
-
-    return processed_file
+    return write_processed_text(PROCESSED_DIR, document_id, text)
 
 
 # =========================================================
@@ -320,17 +284,7 @@ async def upload_document(
     # -----------------------------------------------------
 
     document_id = str(uuid.uuid4())
-
-
-    safe_filename = (
-        f"{document_id}{extension}"
-    )
-
-
-    file_path = (
-        UPLOAD_DIR /
-        safe_filename
-    )
+    safe_filename = source_filename(document_id, extension)
 
 
     # -----------------------------------------------------
@@ -338,13 +292,18 @@ async def upload_document(
     # -----------------------------------------------------
 
     total_size = 0
+    created_files: list[tuple[Path, str, str, str]] = []
 
     try:
-
-        with open(
-            file_path,
-            "wb"
-        ) as buffer:
+        file_path, upload_stream = create_upload_file(
+            UPLOAD_DIR,
+            document_id,
+            extension,
+        )
+        created_files.append(
+            (UPLOAD_DIR, document_id, safe_filename, safe_filename)
+        )
+        with upload_stream as buffer:
 
             while True:
 
@@ -361,12 +320,6 @@ async def upload_document(
                 # 20 MB limit
 
                 if total_size > MAX_FILE_SIZE:
-
-                    buffer.close()
-
-                    if file_path.exists():
-                        file_path.unlink()
-
                     raise HTTPException(
                         status_code=413,
                         detail="File size cannot exceed 20 MB."
@@ -375,24 +328,35 @@ async def upload_document(
 
                 buffer.write(chunk)
 
-
-    except HTTPException:
+    except HTTPException as error:
+        if not cleanup_document_files(created_files):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload failed and temporary file cleanup could not be confirmed.",
+            ) from error
         raise
-
-    except Exception as e:
-
-        if file_path.exists():
-            file_path.unlink()
-
-        print(
-            "Document upload error:",
-            repr(e)
-        )
-
+    except OSError as error:
+        cleanup_succeeded = cleanup_document_files(created_files)
+        logger.exception("Document upload write failed")
         raise HTTPException(
-            status_code=500,
-            detail="Unable to upload document."
-        )
+            status_code=503 if not cleanup_succeeded else 500,
+            detail=(
+                "Unable to upload document."
+                if cleanup_succeeded
+                else "Upload failed and temporary file cleanup could not be confirmed."
+            ),
+        ) from error
+    except Exception as error:
+        cleanup_succeeded = cleanup_document_files(created_files)
+        logger.exception("Document upload failed")
+        raise HTTPException(
+            status_code=503 if not cleanup_succeeded else 500,
+            detail=(
+                "Unable to upload document."
+                if cleanup_succeeded
+                else "Upload failed and temporary file cleanup could not be confirmed."
+            ),
+        ) from error
 
     finally:
 
@@ -422,6 +386,7 @@ async def upload_document(
     # PROCESS DOCUMENT
     # =====================================================
 
+    expected_processed_filename = processed_filename(document_id)
     try:
 
         extracted_text = extract_text(
@@ -451,9 +416,28 @@ async def upload_document(
         # Save extracted text
         # -------------------------------------------------
 
-        processed_file = save_processed_text(
-            document_id,
-            extracted_text
+        try:
+            processed_file = save_processed_text(
+                document_id,
+                extracted_text
+            )
+        except ProcessedTextCleanupError as error:
+            created_files.append(
+                (
+                    PROCESSED_DIR,
+                    document_id,
+                    error.destination.name,
+                    expected_processed_filename,
+                )
+            )
+            raise
+        created_files.append(
+            (
+                PROCESSED_DIR,
+                document_id,
+                expected_processed_filename,
+                expected_processed_filename,
+            )
         )
 
 
@@ -493,7 +477,7 @@ async def upload_document(
             )
 
     except HTTPException:
-        if not cleanup_document_files(document):
+        if not cleanup_document_files(created_files):
             raise HTTPException(
                 status_code=503,
                 detail="Upload failed and temporary file cleanup could not be confirmed.",
@@ -501,7 +485,7 @@ async def upload_document(
         raise
 
     except sqlite3.Error as e:
-        cleanup_succeeded = cleanup_document_files(document)
+        cleanup_succeeded = cleanup_document_files(created_files)
         logger.exception("Document metadata transaction failed")
         raise HTTPException(
             status_code=503,
@@ -512,8 +496,10 @@ async def upload_document(
         ) from e
 
     except OSError as e:
-        cleanup_succeeded = cleanup_document_files(document)
+        cleanup_succeeded = cleanup_document_files(created_files)
         logger.exception("Document file operation failed")
+        if isinstance(e, ProcessedTextCleanupError):
+            cleanup_succeeded = False
         raise HTTPException(
             status_code=503,
             detail=(
@@ -523,7 +509,7 @@ async def upload_document(
         ) from e
 
     except Exception as e:
-        cleanup_succeeded = cleanup_document_files(document)
+        cleanup_succeeded = cleanup_document_files(created_files)
         logger.exception("Document processing failed")
         raise HTTPException(
             status_code=500 if cleanup_succeeded else 503,
@@ -618,8 +604,9 @@ def get_processed_document(
 
     processed_file = safe_storage_path(
         PROCESSED_DIR,
+        document_id,
         document.get("processed_filename"),
-        f"{document_id}.txt",
+        processed_filename(document_id),
     )
 
     if not processed_file.is_file():
@@ -711,34 +698,15 @@ def delete_document(
         ) from e
 
     document = document_response(row)
-    source_extension = Path(document["filename"]).suffix.lower()
-    if source_extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=503,
-            detail="Document file reference is invalid; deletion was not completed.",
-        )
     try:
-        for directory, filename, expected_filename in (
-            (
-                UPLOAD_DIR,
-                document["filename"],
-                f"{document_id}{source_extension}",
-            ),
-            (
-                PROCESSED_DIR,
-                document.get("processed_filename"),
-                f"{document_id}.txt",
-            ),
-        ):
-            if filename:
-                path = safe_storage_path(
-                    directory,
-                    filename,
-                    expected_filename,
-                )
-                if path.exists():
-                    path.unlink()
-    except (OSError, HTTPException) as e:
+        remove_document_files(
+            UPLOAD_DIR,
+            PROCESSED_DIR,
+            document_id,
+            document["filename"],
+            document.get("processed_filename"),
+        )
+    except (OSError, InvalidDocumentPath) as e:
         logger.exception("Document file cleanup failed")
         raise HTTPException(
             status_code=503,
