@@ -1,4 +1,5 @@
 import { NavLink } from "react-router-dom";
+import { useAuth } from "../auth/useAuth";
 
 import {
   Home,
@@ -11,6 +12,7 @@ import {
 } from "lucide-react";
 
 function Sidebar() {
+  const { user } = useAuth();
   const navItems = [
     {
       to: "/",
@@ -144,17 +146,17 @@ function Sidebar() {
         <div className="mt-3 flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-900/70 p-3">
 
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-semibold">
-            H
+            {user?.email?.charAt(0).toUpperCase() || "G"}
           </div>
 
           <div className="min-w-0">
 
             <p className="truncate text-sm font-medium text-white">
-              Student
+              {user?.email || "Guest"}
             </p>
 
             <p className="truncate text-xs text-slate-500">
-              Free Plan
+              {user ? "Signed in" : "Public access"}
             </p>
 
           </div>

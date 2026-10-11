@@ -1,12 +1,19 @@
+import logging
+import sqlite3
 import uuid
 from pathlib import Path
 from datetime import datetime
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 
 from pypdf import PdfReader
 from docx import Document
 
+from database import open_connection, transaction
+from services.auth import get_current_user, require_csrf
+
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/documents",
@@ -22,6 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 UPLOAD_DIR = BASE_DIR / "uploads" / "documents"
 PROCESSED_DIR = BASE_DIR / "uploads" / "processed"
+METADATA_FILE = BASE_DIR / "uploads" / "documents.json"
 
 UPLOAD_DIR.mkdir(
     parents=True,
@@ -52,10 +60,81 @@ ALLOWED_CONTENT_TYPES = {
 
 
 # =========================================================
-# IN-MEMORY DOCUMENT METADATA
+# LEGACY METADATA LOCATION
 # =========================================================
 
-documents = []
+def document_response(row) -> dict:
+    document = dict(row)
+    document["processed"] = bool(document["processed"])
+    document["size_mb"] = round(document["size"] / (1024 * 1024), 2)
+    document.pop("owner_id", None)
+    document.pop("deleted_at", None)
+    return document
+
+
+def safe_storage_path(
+    directory: Path,
+    filename: str | None,
+    expected_filename: str | None = None,
+) -> Path:
+    if (
+        not filename
+        or Path(filename).name != filename
+        or (expected_filename is not None and filename != expected_filename)
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="Document file is unavailable.",
+        )
+    root = directory.resolve()
+    path = (root / filename).resolve()
+    if path.parent != root:
+        raise HTTPException(
+            status_code=404,
+            detail="Document file is unavailable.",
+        )
+    return path
+
+
+def cleanup_document_files(document) -> bool:
+
+    document_id = document.get("id")
+    source_filename = document.get("filename")
+    source_extension = Path(source_filename).suffix.lower() if source_filename else ""
+    paths = (
+        (
+            UPLOAD_DIR,
+            source_filename,
+            f"{document_id}{source_extension}"
+            if source_extension in ALLOWED_EXTENSIONS
+            else None,
+        ),
+        (
+            PROCESSED_DIR,
+            document.get("processed_filename"),
+            f"{document_id}.txt",
+        ),
+    )
+    succeeded = True
+    for location, filename, expected_filename in paths:
+        if not filename:
+            continue
+
+        try:
+            file_path = safe_storage_path(
+                location,
+                filename,
+                expected_filename,
+            )
+            if file_path.exists():
+                file_path.unlink()
+        except HTTPException:
+            logger.error("Refusing to clean up an unsafe document path")
+            succeeded = False
+        except OSError:
+            logger.exception("Document file cleanup failed")
+            succeeded = False
+    return succeeded
 
 
 # =========================================================
@@ -186,7 +265,8 @@ def save_processed_text(
 
 @router.post("/upload")
 async def upload_document(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    user: dict[str, str] = Depends(require_csrf),
 ):
 
     # -----------------------------------------------------
@@ -320,42 +400,23 @@ async def upload_document(
 
 
     # -----------------------------------------------------
-    # Create initial metadata
+    # Build document metadata after extraction succeeds
     # -----------------------------------------------------
 
     document = {
-
         "id": document_id,
-
         "name": original_filename,
-
         "filename": safe_filename,
-
         "type": extension.replace(
             ".",
             ""
         ).upper(),
-
         "size": total_size,
-
-        "size_mb": round(
-            total_size / (1024 * 1024),
-            2
-        ),
-
         "status": "Processing",
-
         "uploaded_at": datetime.now().isoformat(),
-
         "processed": False,
-
-        "text_length": 0
-
+        "text_length": 0,
     }
-
-
-    documents.append(document)
-
 
     # =====================================================
     # PROCESS DOCUMENT
@@ -397,60 +458,93 @@ async def upload_document(
 
 
         # -------------------------------------------------
-        # Update metadata
+        # Complete metadata before inserting the ownership record
         # -------------------------------------------------
 
         document["status"] = "Processed"
-
         document["processed"] = True
+        document["text_length"] = len(extracted_text)
+        document["processed_filename"] = processed_file.name
+        document["processed_at"] = datetime.now().isoformat()
 
-        document["text_length"] = len(
-            extracted_text
-        )
-
-        document["processed_filename"] = (
-            processed_file.name
-        )
-
-        document["processed_at"] = (
-            datetime.now().isoformat()
-        )
-
+        with transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO documents (
+                    id, owner_id, name, filename, processed_filename, type,
+                    size, status, uploaded_at, processed, text_length, processed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document["id"],
+                    user["id"],
+                    document["name"],
+                    document["filename"],
+                    document["processed_filename"],
+                    document["type"],
+                    document["size"],
+                    document["status"],
+                    document["uploaded_at"],
+                    1,
+                    document["text_length"],
+                    document["processed_at"],
+                ),
+            )
 
     except HTTPException:
-
+        if not cleanup_document_files(document):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload failed and temporary file cleanup could not be confirmed.",
+            )
         raise
 
-    except Exception as e:
-
-        print(
-            "Document processing error:",
-            repr(e)
-        )
-
-        document["status"] = "Processing Failed"
-
+    except sqlite3.Error as e:
+        cleanup_succeeded = cleanup_document_files(document)
+        logger.exception("Document metadata transaction failed")
         raise HTTPException(
-            status_code=500,
-            detail="Unable to process document."
-        )
+            status_code=503,
+            detail=(
+                "Unable to save document metadata; temporary file cleanup "
+                + ("completed." if cleanup_succeeded else "could not be confirmed.")
+            ),
+        ) from e
 
+    except OSError as e:
+        cleanup_succeeded = cleanup_document_files(document)
+        logger.exception("Document file operation failed")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Document storage failed; temporary file cleanup "
+                + ("completed." if cleanup_succeeded else "could not be confirmed.")
+            ),
+        ) from e
+
+    except Exception as e:
+        cleanup_succeeded = cleanup_document_files(document)
+        logger.exception("Document processing failed")
+        raise HTTPException(
+            status_code=500 if cleanup_succeeded else 503,
+            detail=(
+                "Unable to process document."
+                if cleanup_succeeded
+                else "Document processing failed and temporary file cleanup could not be confirmed."
+            ),
+        ) from e
 
     # =====================================================
     # RETURN RESPONSE
     # =====================================================
 
     return {
-
         "success": True,
-
         "message": (
             "Document uploaded and "
             "processed successfully."
         ),
-
         "document": document
-
     }
 
 
@@ -459,78 +553,81 @@ async def upload_document(
 # =========================================================
 
 @router.get("")
-def get_documents():
+def get_documents(user: dict[str, str] = Depends(get_current_user)):
+    try:
+        with open_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, name, filename, processed_filename, type, size,
+                       status, uploaded_at, processed, text_length, processed_at
+                FROM documents
+                WHERE owner_id = ? AND deleted_at IS NULL
+                ORDER BY uploaded_at DESC
+                """,
+                (user["id"],),
+            ).fetchall()
+    except (sqlite3.Error, OSError) as e:
+        logger.exception("Document listing query failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Documents are temporarily unavailable.",
+        ) from e
 
-    return {
-
-        "success": True,
-
-        "documents": documents
-
-    }
+    return {"success": True, "documents": [document_response(row) for row in rows]}
 
 
 # =========================================================
 # GET PROCESSED TEXT
 # =========================================================
 
-@router.get("/{document_id}/content")
-def get_document_content(
-    document_id: str
+def get_processed_document(
+    document_id: str,
+    owner_id: str,
+    require_text: bool = False
 ):
 
-    document = next(
-        (
-            item
-            for item in documents
-            if item["id"] == document_id
-        ),
-        None
-    )
-
-
-    if not document:
-
+    try:
+        with open_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id, owner_id, name, filename, processed_filename, type,
+                       size, status, uploaded_at, processed, text_length,
+                       processed_at, deleted_at
+                FROM documents
+                WHERE id = ? AND owner_id = ? AND deleted_at IS NULL
+                """,
+                (document_id, owner_id),
+            ).fetchone()
+    except (sqlite3.Error, OSError) as e:
+        logger.exception("Document lookup failed")
         raise HTTPException(
-            status_code=404,
-            detail="Document not found."
-        )
+            status_code=503,
+            detail="Document is temporarily unavailable.",
+        ) from e
 
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found.")
 
-    if not document.get("processed"):
+    document = document_response(row)
+    if not document["processed"]:
 
         raise HTTPException(
             status_code=409,
             detail="Document has not been processed yet."
         )
 
-
-    processed_filename = document.get(
-        "processed_filename"
+    processed_file = safe_storage_path(
+        PROCESSED_DIR,
+        document.get("processed_filename"),
+        f"{document_id}.txt",
     )
 
-
-    if not processed_filename:
+    if not processed_file.is_file():
 
         raise HTTPException(
             status_code=404,
             detail="Processed content not found."
         )
-
-
-    processed_file = (
-        PROCESSED_DIR /
-        processed_filename
-    )
-
-
-    if not processed_file.exists():
-
-        raise HTTPException(
-            status_code=404,
-            detail="Processed content file not found."
-        )
-
 
     try:
 
@@ -538,31 +635,36 @@ def get_document_content(
             encoding="utf-8"
         )
 
-    except Exception as e:
+    except OSError as e:
+        logger.exception("Processed document read failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to read processed document.",
+        ) from e
 
-        print(
-            "Read processed document error:",
-            repr(e)
-        )
+    if require_text and not text.strip():
 
         raise HTTPException(
-            status_code=500,
-            detail="Unable to read processed document."
+            status_code=422,
+            detail="Document content is empty."
         )
 
+    return document, text
+
+@router.get("/{document_id}/content")
+def get_document_content(
+    document_id: str,
+    user: dict[str, str] = Depends(get_current_user),
+):
+
+    document, text = get_processed_document(document_id, user["id"])
 
     return {
-
         "success": True,
-
         "document_id": document_id,
-
         "name": document["name"],
-
         "text": text,
-
         "text_length": len(text)
-
     }
 
 
@@ -572,86 +674,94 @@ def get_document_content(
 
 @router.delete("/{document_id}")
 def delete_document(
-    document_id: str
+    document_id: str,
+    user: dict[str, str] = Depends(require_csrf),
 ):
-
-    document = next(
-        (
-            item
-            for item in documents
-            if item["id"] == document_id
-        ),
-        None
-    )
-
-
-    if not document:
-
+    try:
+        with transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT id, owner_id, name, filename, processed_filename,
+                       type, size, status, uploaded_at, processed, text_length,
+                       processed_at, deleted_at
+                FROM documents
+                WHERE id = ? AND owner_id = ?
+                """,
+                (document_id, user["id"]),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Document not found.",
+                )
+            if row["deleted_at"] is None:
+                connection.execute(
+                    "UPDATE documents SET deleted_at = ? WHERE id = ? AND owner_id = ?",
+                    (
+                        datetime.now().isoformat(),
+                        document_id,
+                        user["id"],
+                    ),
+                )
+    except (sqlite3.Error, OSError) as e:
+        logger.exception("Document deletion state update failed")
         raise HTTPException(
-            status_code=404,
-            detail="Document not found."
+            status_code=503,
+            detail="Unable to delete document. Please retry.",
+        ) from e
+
+    document = document_response(row)
+    source_extension = Path(document["filename"]).suffix.lower()
+    if source_extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=503,
+            detail="Document file reference is invalid; deletion was not completed.",
         )
-
-
-    # -----------------------------------------------------
-    # Delete original file
-    # -----------------------------------------------------
-
-    file_path = (
-        UPLOAD_DIR /
-        document["filename"]
-    )
-
+    try:
+        for directory, filename, expected_filename in (
+            (
+                UPLOAD_DIR,
+                document["filename"],
+                f"{document_id}{source_extension}",
+            ),
+            (
+                PROCESSED_DIR,
+                document.get("processed_filename"),
+                f"{document_id}.txt",
+            ),
+        ):
+            if filename:
+                path = safe_storage_path(
+                    directory,
+                    filename,
+                    expected_filename,
+                )
+                if path.exists():
+                    path.unlink()
+    except (OSError, HTTPException) as e:
+        logger.exception("Document file cleanup failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to complete document deletion. Please retry.",
+        ) from e
 
     try:
-
-        if file_path.exists():
-            file_path.unlink()
-
-
-        # -------------------------------------------------
-        # Delete processed text
-        # -------------------------------------------------
-
-        processed_filename = document.get(
-            "processed_filename"
-        )
-
-
-        if processed_filename:
-
-            processed_file = (
-                PROCESSED_DIR /
-                processed_filename
+        with transaction() as connection:
+            connection.execute(
+                "DELETE FROM documents WHERE id = ? AND owner_id = ?",
+                (document_id, user["id"]),
             )
-
-            if processed_file.exists():
-                processed_file.unlink()
-
-
-    except Exception as e:
-
-        print(
-            "Document delete error:",
-            repr(e)
-        )
-
+    except (sqlite3.Error, OSError) as e:
+        logger.exception("Document metadata deletion failed")
         raise HTTPException(
-            status_code=500,
-            detail="Unable to delete document."
-        )
-
-
-    documents.remove(document)
-
+            status_code=503,
+            detail="Unable to complete document deletion. Please retry.",
+        ) from e
 
     return {
-
         "success": True,
-
         "message": (
             "Document and processed content "
             "deleted successfully."
         )
-
     }

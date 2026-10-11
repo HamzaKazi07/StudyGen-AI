@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from collections import defaultdict
 
@@ -6,13 +7,21 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from services.ai_service import stream_gemini
+from routes.documents import get_processed_document
+from services.auth import get_current_user, require_csrf
+from services.ai_service import (
+    GeminiConfigurationError,
+    MAX_DOCUMENT_CONTEXT_CHARS,
+    stream_gemini,
+)
 
 
 router = APIRouter(
     prefix="/api/tutor",
     tags=["AI Tutor"]
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------
@@ -34,6 +43,8 @@ class TutorRequest(BaseModel):
     history: list[ChatMessage] = Field(
         default_factory=list
     )
+
+    document_id: str | None = None
 
 
 # ---------------------------------------------------------
@@ -85,7 +96,7 @@ def create_sse_event(event_type: str, data):
 @router.post("/ask")
 def ask_tutor(
     request: TutorRequest,
-    http_request: Request
+    http_request: Request,
 ):
 
     # -----------------------------------------------------
@@ -146,6 +157,32 @@ def ask_tutor(
     # Keep latest 20 messages
     history = history[-20:]
 
+    document_context = None
+    document_name = None
+    document_context_truncated = False
+    document_context_total_chars = 0
+
+    if request.document_id is not None:
+        user = require_csrf(
+            http_request,
+            get_current_user(http_request),
+        )
+
+        document, document_text = get_processed_document(
+            request.document_id,
+            owner_id=user["id"],
+            require_text=True
+        )
+
+        document_name = document["name"]
+        document_context_total_chars = len(document_text)
+        document_context_truncated = (
+            document_context_total_chars > MAX_DOCUMENT_CONTEXT_CHARS
+        )
+        document_context = document_text[
+            :MAX_DOCUMENT_CONTEXT_CHARS
+        ]
+
 
     # -----------------------------------------------------
     # Streaming Generator
@@ -156,18 +193,38 @@ def ask_tutor(
         try:
 
             # Tell frontend streaming has started
+            start_data = {
+                "success": True
+            }
+
+            if request.document_id is not None:
+                start_data.update(
+                    {
+                        "document_id": request.document_id,
+                        "document_name": document_name,
+                        "document_context_truncated": (
+                            document_context_truncated
+                        ),
+                        "document_context_chars": len(document_context),
+                        "document_extracted_chars": (
+                            document_context_total_chars
+                        ),
+                    }
+                )
+
             yield create_sse_event(
                 "start",
-                {
-                    "success": True
-                }
+                start_data
             )
 
 
             # Stream Gemini response
             for chunk in stream_gemini(
                 question=question,
-                history=history
+                history=history,
+                document_context=document_context,
+                document_context_truncated=document_context_truncated,
+                document_context_total_chars=document_context_total_chars,
             ):
 
                 yield create_sse_event(
@@ -187,12 +244,22 @@ def ask_tutor(
             )
 
 
+        except GeminiConfigurationError:
+            yield create_sse_event(
+                "error",
+                {
+                    "message": (
+                        "The AI Tutor is not configured. "
+                        "Please contact the administrator."
+                    )
+                },
+            )
+
         except Exception as e:
 
-            # Full error only in backend terminal
-            print(
-                "Gemini Streaming Error:",
-                repr(e)
+            logger.error(
+                "Tutor response generation failed (%s)",
+                type(e).__name__,
             )
 
 

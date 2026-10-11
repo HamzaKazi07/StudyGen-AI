@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-
-const API_URL =
-  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+import { useNavigate } from "react-router-dom";
+import { apiFetch } from "../lib/api";
 
 function Documents() {
   const fileInputRef = useRef(null);
+  const navigate = useNavigate();
 
   const [documents, setDocuments] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -14,39 +14,45 @@ function Documents() {
   const [success, setSuccess] = useState("");
 
   // =====================================================
-  // GET DOCUMENTS
-  // =====================================================
-
-  const fetchDocuments = async () => {
-    try {
-      setLoading(true);
-      setError("");
-
-      const response = await fetch(
-        `${API_URL}/api/documents`
-      );
-
-      if (!response.ok) {
-        throw new Error("Unable to load documents.");
-      }
-
-      const data = await response.json();
-
-      setDocuments(data.documents || []);
-    } catch (err) {
-      console.error("Fetch documents error:", err);
-      setError("Unable to load documents.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // =====================================================
   // LOAD DOCUMENTS WHEN PAGE OPENS
   // =====================================================
 
   useEffect(() => {
-    fetchDocuments();
+    let active = true;
+
+    const loadDocuments = async () => {
+      try {
+        setError("");
+
+        const response = await apiFetch("/api/documents");
+
+        if (!response.ok) {
+          throw new Error("Unable to load documents.");
+        }
+
+        const data = await response.json();
+
+        if (active) {
+          setDocuments(data.documents || []);
+        }
+      } catch (err) {
+        console.error("Fetch documents error:", err);
+
+        if (active) {
+          setError("Unable to load documents.");
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    };
+
+    loadDocuments();
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   // =====================================================
@@ -125,8 +131,8 @@ function Documents() {
 
       formData.append("file", file);
 
-      const response = await fetch(
-        `${API_URL}/api/documents/upload`,
+      const response = await apiFetch(
+        "/api/documents/upload",
         {
           method: "POST",
           body: formData,
@@ -186,8 +192,8 @@ function Documents() {
       setError("");
       setSuccess("");
 
-      const response = await fetch(
-        `${API_URL}/api/documents/${documentId}`,
+      const response = await apiFetch(
+        `/api/documents/${documentId}`,
         {
           method: "DELETE",
         }
@@ -517,6 +523,15 @@ function Documents() {
 
                       <button
                         type="button"
+                        onClick={() =>
+                          navigate(
+                            `/ai-tutor?document_id=${encodeURIComponent(document.id)}`
+                          )
+                        }
+                        disabled={
+                          document.status !== "Processed" ||
+                          !document.processed
+                        }
                         className="flex-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium hover:bg-indigo-500"
                       >
                         Ask AI

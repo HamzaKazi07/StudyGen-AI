@@ -4,7 +4,7 @@
 
 **Created**: 2026-09-14
 
-**Status**: Draft
+**Status**: Partially implemented; acceptance and success criteria are not fully verified.
 
 **Input**: User description: "Build Feature 001: Document-Aware AI Tutor for StudyGen-AI. Allow a student to select an uploaded PDF, DOCX, or TXT study document, ask questions about its content, receive grounded answers or a clear not-found message, continue with follow-up questions, and preserve existing uploads and StudyGen-AI functionality."
 
@@ -110,6 +110,10 @@ A student can continue uploading, listing, deleting, and using documents as befo
 - **FR-017**: The system MUST keep document contents private by avoiding document text in user-facing errors, diagnostic output, or unrelated responses.
 - **FR-018**: The system MUST expose enough stable success and failure information for the frontend to distinguish a grounded answer, a not-found-in-document answer, an unavailable document, an invalid request, and a temporary service failure.
 - **FR-019**: Verification MUST cover document processing, at least one successful question answered from document content, a question unsupported by that content, and unsuccessful requests for missing, invalid, deleted, unprocessed, empty, and content-unavailable documents.
+- **FR-020**: Document-aware answers MUST treat supplied extracted text as primary evidence, distinguish proposed/planned features from implementation claims, identify conflicting statements, and avoid presenting unsupported assumptions as document facts.
+- **FR-021**: The system MUST tell the model and user when only an excerpt is supplied, MUST disclose that unseen extracted text was not examined, and MUST NOT claim that the complete document was reviewed in that case.
+- **FR-022**: References to document sections or pages MUST only be provided when they can be reliably derived from supplied text; any helpful outside knowledge MUST be labeled separately from document evidence.
+- **FR-023**: Document content MUST remain untrusted input and MUST NOT override tutor instructions. Prompt guidance is a mitigation, not a guarantee of prompt-injection resistance.
 
 ### Key Entities *(include if feature involves data)*
 
@@ -140,3 +144,26 @@ A student can continue uploading, listing, deleting, and using documents as befo
 - No new framework or database is required for the feature; any change to existing storage or service boundaries must be justified during planning.
 - The first version supports one active selected document per tutor conversation; multi-document comparison is out of scope.
 - Document content is processed before it becomes eligible for document-grounded questions; processing failures remain visible as unavailable states.
+
+## Implementation Evidence (2026-10-11)
+
+This section records repository evidence without changing the requirements or treating the feature as complete.
+
+### Implemented evidence
+
+- The Documents page links a processed document to `/ai-tutor?document_id=...`; the Tutor page loads the document metadata and includes the selected ID in tutor requests.
+- The backend validates document availability and processed text before starting a document-aware response stream.
+- Document-aware requests require a valid session, CSRF token, and a database query scoped to the authenticated owner before the extracted text is read.
+- The backend passes up to the first 12,000 extracted characters to the AI service. Prompt construction distinguishes complete extracted text from a partial excerpt, and additive SSE start metadata reports truncation plus supplied/total character counts. The frontend shows a notice when later extracted text was not sent.
+- System instructions tell the model to prioritize document evidence, distinguish proposed/planned features from established implementation claims, identify contradictions, avoid unsupported claims and unreliable section/page references, separate useful general knowledge, and treat document content as untrusted. These are prompt mitigations and do not guarantee model compliance.
+- Tutor responses are delivered as SSE events. General tutor requests remain possible without a document ID.
+- Backend `unittest` coverage uses mocked provider output to exercise document-evidence pass-through for supported facts, proposed and unverified features, contradictory statements, missing information, excerpt-limited questions, and prompt-injection-like text. It also checks SSE context metadata, streaming, context bounds, ownership denial, guest/general requests, and selected-document failure states.
+
+### Incomplete or unverified requirements
+
+- No live Gemini request or browser end-to-end test was run. Tests mock provider responses and establish prompt/request/stream plumbing, not actual model answer quality, factual grounding, contradiction detection, proposed-versus-implemented classification, or resistance to prompt injection.
+- The UI displays the selected document and warns about partial context, but answers have no separately persisted or verified citation/source record. Context is the first excerpt, not retrieval across the full document; relevant passages after the boundary can be missed.
+- Upload/extraction format edge cases, MIME spoofing, file-size boundary behavior, loading/empty UI states, accessibility, and all specified success-criterion thresholds remain unverified.
+- No embeddings, chunking, retrieval ranking, source-location tracking, or citation validation are implemented. Prompt-injection wording does not guarantee isolation against malicious document content.
+
+The specification's acceptance scenarios and success criteria remain targets until each is independently verified. See [`docs/FEATURES.md`](../../docs/FEATURES.md) and [`docs/TESTING.md`](../../docs/TESTING.md) for the current inventory and test scope.

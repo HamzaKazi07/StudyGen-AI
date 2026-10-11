@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-
-const API_URL =
-  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+import { Navigate, useLocation, useSearchParams } from "react-router-dom";
+import { useAuth } from "../auth/useAuth";
+import { apiFetch } from "../lib/api";
 
 function AITutor() {
+  const { user, loading: authLoading, restoreError, restoreSession } = useAuth();
+  const location = useLocation();
   // -----------------------------------------------------
   // State
   // -----------------------------------------------------
@@ -19,12 +21,21 @@ function AITutor() {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [selectedDocument, setSelectedDocument] = useState(null);
+  const [documentLoading, setDocumentLoading] = useState(false);
+  const [documentError, setDocumentError] = useState("");
+  const [documentContextInfo, setDocumentContextInfo] = useState(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  const selectedDocumentId = searchParams.get("document_id");
 
   // -----------------------------------------------------
   // Chat scroll reference
   // -----------------------------------------------------
 
   const chatContainerRef = useRef(null);
+  const activeRequestRef = useRef(null);
+  const isMountedRef = useRef(true);
 
   // -----------------------------------------------------
   // Automatically scroll chat to latest message
@@ -38,6 +49,90 @@ function AITutor() {
     container.scrollTop = container.scrollHeight;
   }, [messages, loading]);
 
+  useEffect(() => {
+    isMountedRef.current = true;
+
+    return () => {
+      isMountedRef.current = false;
+      activeRequestRef.current?.abort();
+      activeRequestRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    const loadSelectedDocument = async () => {
+      if (!selectedDocumentId) {
+        setSelectedDocument(null);
+        setDocumentError("");
+        setDocumentLoading(false);
+        return;
+      }
+
+      if (authLoading || !user) {
+        setSelectedDocument(null);
+        setDocumentLoading(false);
+        return;
+      }
+
+      try {
+        setDocumentLoading(true);
+        setDocumentError("");
+
+        const response = await apiFetch("/api/documents");
+
+        if (!response.ok) {
+          throw new Error(
+            "Unable to load the selected document."
+          );
+        }
+
+        const data = await response.json();
+        const document = (data.documents || []).find(
+          (item) => item.id === selectedDocumentId
+        );
+
+        if (!document) {
+          throw new Error(
+            "The selected document is no longer available."
+          );
+        }
+
+        if (
+          document.status !== "Processed" ||
+          !document.processed
+        ) {
+          throw new Error(
+            "The selected document is not ready for tutoring."
+          );
+        }
+
+        if (active) {
+          setSelectedDocument(document);
+        }
+      } catch (err) {
+        if (active) {
+          setSelectedDocument(null);
+          setDocumentError(
+            err.message ||
+              "Unable to load the selected document."
+          );
+        }
+      } finally {
+        if (active) {
+          setDocumentLoading(false);
+        }
+      }
+    };
+
+    loadSelectedDocument();
+
+    return () => {
+      active = false;
+    };
+  }, [selectedDocumentId, authLoading, user]);
+
   // -----------------------------------------------------
   // Ask AI
   // -----------------------------------------------------
@@ -49,8 +144,20 @@ function AITutor() {
     return;
   }
 
+  if (selectedDocumentId && (documentLoading || documentError)) {
+    setError(
+      documentError ||
+        "The selected document is not ready for tutoring."
+    );
+    return;
+  }
+
   setError("");
   setLoading(true);
+
+  const controller = new AbortController();
+  activeRequestRef.current = controller;
+  let streamCompleted = false;
 
   // ---------------------------------------------------
   // Add user message immediately
@@ -90,8 +197,8 @@ function AITutor() {
     // Send request to backend
     // -------------------------------------------------
 
-    const response = await fetch(
-      `${API_URL}/api/tutor/ask`,
+    const response = await apiFetch(
+      "/api/tutor/ask",
       {
         method: "POST",
 
@@ -100,9 +207,14 @@ function AITutor() {
           Accept: "text/event-stream",
         },
 
+        signal: controller.signal,
+
         body: JSON.stringify({
           question: trimmedQuestion,
           history: history,
+            ...(selectedDocumentId
+              ? { document_id: selectedDocumentId }
+              : {}),
         }),
       }
     );
@@ -122,6 +234,15 @@ function AITutor() {
           errorData?.detail || errorMessage;
       } catch {
         // Ignore JSON parsing error
+      }
+
+      if (
+        selectedDocumentId &&
+        [404, 409, 422].includes(response.status)
+      ) {
+        setSelectedDocument(null);
+        setDocumentError(errorMessage);
+        setSearchParams({});
       }
 
       throw new Error(errorMessage);
@@ -219,6 +340,15 @@ function AITutor() {
         // AI text chunk
         // ---------------------------------------------
 
+        if (eventType === "start" && selectedDocumentId) {
+          setDocumentContextInfo({
+            documentId: selectedDocumentId,
+            truncated: data?.document_context_truncated === true,
+            suppliedChars: data?.document_context_chars,
+            totalChars: data?.document_extracted_chars,
+          });
+        }
+
         if (eventType === "chunk") {
           const textChunk = data?.text || "";
 
@@ -260,10 +390,15 @@ function AITutor() {
         // ---------------------------------------------
 
         if (eventType === "done") {
-          // Nothing required here.
-          // The assistant message is already updated.
+          streamCompleted = true;
         }
       }
+    }
+
+    if (!streamCompleted) {
+      throw new Error(
+        "The AI response was interrupted. Please try again."
+      );
     }
 
     // -------------------------------------------------
@@ -277,6 +412,10 @@ function AITutor() {
     }
 
   } catch (err) {
+    if (err.name === "AbortError" || controller.signal.aborted) {
+      return;
+    }
+
     console.error(
       "AI Tutor Streaming Error:",
       err
@@ -303,7 +442,13 @@ function AITutor() {
     );
 
   } finally {
-    setLoading(false);
+    if (activeRequestRef.current === controller) {
+      activeRequestRef.current = null;
+    }
+
+    if (isMountedRef.current) {
+      setLoading(false);
+    }
   }
 };
 
@@ -335,6 +480,47 @@ function AITutor() {
 
     setError("");
   };
+
+  const clearSelectedDocument = () => {
+    setSelectedDocument(null);
+    setDocumentError("");
+    setDocumentContextInfo(null);
+    setError("");
+    setSearchParams({});
+  };
+
+  if (selectedDocumentId && authLoading) {
+    return (
+      <main className="flex h-[calc(100dvh-80px)] items-center justify-center text-slate-300">
+        Restoring your session...
+      </main>
+    );
+  }
+
+  if (selectedDocumentId && restoreError) {
+    return (
+      <main className="flex h-[calc(100dvh-80px)] flex-col items-center justify-center gap-4 text-slate-300">
+        <p role="alert">{restoreError}</p>
+        <button
+          className="rounded-lg bg-indigo-600 px-4 py-2 font-semibold text-white hover:bg-indigo-500"
+          type="button"
+          onClick={restoreSession}
+        >
+          Retry
+        </button>
+      </main>
+    );
+  }
+
+  if (selectedDocumentId && !user) {
+    return (
+      <Navigate
+        to="/login"
+        replace
+        state={{ from: location }}
+      />
+    );
+  }
 
   // -----------------------------------------------------
   // JSX
@@ -399,6 +585,58 @@ function AITutor() {
               Ask questions, understand difficult topics,
               and learn with your AI tutor.
             </p>
+
+            {documentLoading && (
+              <p className="mt-2 text-xs text-slate-500">
+                Loading selected document...
+              </p>
+            )}
+
+            {selectedDocument && (
+              <div className="mt-3 flex items-center gap-3 text-xs text-emerald-300">
+                <span>
+                  Using document: {selectedDocument.name}
+                </span>
+
+                <button
+                  type="button"
+                  onClick={clearSelectedDocument}
+                  disabled={loading}
+                  className="text-slate-400 underline hover:text-white disabled:opacity-50"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+
+            {documentContextInfo?.documentId === selectedDocumentId &&
+              documentContextInfo?.truncated && (
+              <p
+                className="mt-2 text-xs text-amber-300"
+                role="status"
+              >
+                Answers use an excerpt of the extracted text
+                {Number.isInteger(documentContextInfo.suppliedChars) &&
+                  Number.isInteger(documentContextInfo.totalChars) &&
+                  ` (${documentContextInfo.suppliedChars.toLocaleString()} of ${documentContextInfo.totalChars.toLocaleString()} characters)`}.
+                They may not cover content outside that excerpt.
+              </p>
+            )}
+
+            {documentError && (
+              <div className="mt-3 flex items-center gap-3 text-xs text-amber-300">
+                <span>{documentError}</span>
+
+                <button
+                  type="button"
+                  onClick={clearSelectedDocument}
+                  disabled={loading}
+                  className="text-slate-400 underline hover:text-white disabled:opacity-50"
+                >
+                  Use general tutor
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Clear Chat */}
@@ -845,7 +1083,9 @@ function AITutor() {
                   onClick={askTutor}
                   disabled={
                     loading ||
-                    !question.trim()
+                    !question.trim() ||
+                    documentLoading ||
+                    Boolean(documentError)
                   }
                   className="
                     shrink-0

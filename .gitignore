@@ -40,6 +40,7 @@ backend/uploads/*
 backend/*.db
 backend/*.sqlite
 backend/*.sqlite3
+backend/data/
 
 # ==============================
 # Frontend / Node
